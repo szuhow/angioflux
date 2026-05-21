@@ -1,0 +1,61 @@
+# Default Angio-FLUX configuration (no EKG variant)
+
+seed: 1337
+
+data:
+  height: 128
+  width: 128
+  num_frames: 32
+  batch_size: 2
+
+hee:
+  theta0: 0.05          # base log-intensity threshold
+  alpha: 2.0            # adaptive scaling
+  window: [7, 7, 5]     # H, W, T local stats window
+  drift_window: 31      # suppress broad frame-to-frame brightness drift
+  theta_min_frac: 0.6   # keep high-CV regions from becoming too noisy
+  eps: 1.0e-6
+
+voxel:
+  num_bins: 8           # temporal bins per polarity channel
+  # 4 polarities × num_bins = total channels into S-UNet
+
+adlif:
+  beta: 0.9             # membrane decay
+  rho: 0.95             # adaptation decay
+  a: 0.05               # sub-threshold adaptation coupling
+  b: 0.1                # spike-triggered adaptation jump
+  v_th: 1.0
+
+plsr:
+  hidden: 16
+
+sunet:
+  base_channels: 32
+  out_channels: 1
+
+flux_gnn:
+  node_feat_dim: 8
+  hidden_dim: 64
+  num_classes_aha: 17
+  num_stenosis_bins: 4   # 0%, <50%, 50-70%, >70%
+  knn_k: 8
+
+vqfr:
+  mu_blood: 3.5e-3       # Pa·s
+  pressure_aortic: 100.0 # mmHg (normalized)
+
+loss:
+  lambda_cldice: 1.0
+  lambda_aha: 0.5
+  lambda_stenosis: 1.0
+  lambda_vqfr: 0.5
+  lambda_spike: 1.0e-3
+  spike_target_rate: 0.05
+
+train:
+  epochs: 3
+  lr: 3.0e-4
+  weight_decay: 1.0e-5
+  device: "cpu"          # set to "cuda" if available
+  steps_per_epoch: 8

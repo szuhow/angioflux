@@ -1,0 +1,67 @@
+# Self-supervised pretraining on real angiographic sequences.
+# No ground-truth labels required.
+
+seed: 1337
+
+data:
+  root: "/Users/rafalszulinski/Desktop/developing/IVES/coronary/angio-frame-selector/data"
+  target_size: [192, 192]   # downsample 512→192 for CPU
+  max_frames: 12
+  min_frames: 6
+
+hee:
+  theta0: 0.05
+  alpha: 2.0
+  window: [7, 7, 5]
+  drift_window: 31
+  theta_min_frac: 0.6
+  eps: 1.0e-6
+
+voxel:
+  num_bins: 4
+
+adlif:
+  beta: 0.9
+  rho: 0.95
+  a: 0.05
+  b: 0.1
+  v_th: 1.0
+
+plsr:
+  hidden: 16
+
+sunet:
+  base_channels: 32
+  out_channels: 1
+
+flux_gnn:
+  node_feat_dim: 8
+  hidden_dim: 32
+  num_classes_aha: 17
+  num_stenosis_bins: 4
+  knn_k: 8
+
+vqfr:
+  mu_blood: 3.5e-3
+  pressure_aortic: 100.0
+
+ssl:
+  lambda_recon: 1.0
+  lambda_mask: 1.5
+  lambda_bat: 0.5
+  lambda_amp: 0.5
+  lambda_consist: 0.1
+  lambda_spike: 1.0e-3
+  pos_weight: 24.0
+
+loss:
+  spike_target_rate: 0.05
+
+train:
+  epochs: 2
+  lr: 3.0e-4
+  weight_decay: 1.0e-5
+  device: "cpu"
+  batch_size: 1
+  num_workers: 0
+  ckpt_dir: "checkpoints/ssl"
