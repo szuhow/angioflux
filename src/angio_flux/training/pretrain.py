@@ -107,7 +107,7 @@ def main() -> None:
             video = batch["video"].to(device)
             optim.zero_grad()
             out = model(video)
-            targets = build_targets(video, out["events"])
+            targets = build_targets(video, out["events"], pseudo_gt_cfg=cfg.get("pseudo_gt"))
             loss, parts = loss_fn(out, video, targets=targets)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)

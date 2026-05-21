@@ -115,6 +115,161 @@ def _masked_quantile(x: torch.Tensor, mask: torch.Tensor, q: float, fallback: fl
     return torch.stack(vals).view(-1, 1, 1, 1)
 
 
+def _scale_for_resolution(height: int, width: int, reference_size: float) -> float:
+    return max(0.25, min(height, width) / max(1.0, float(reference_size)))
+
+
+def _scaled_px(px: int, height: int, width: int, reference_size: float) -> int:
+    if px <= 0:
+        return 0
+    return max(1, int(round(px * _scale_for_resolution(height, width, reference_size))))
+
+
+def _scaled_sigmas(
+    sigmas: tuple[float, ...],
+    height: int,
+    width: int,
+    reference_size: float,
+    min_sigma: float = 0.6,
+) -> tuple[float, ...]:
+    scale = _scale_for_resolution(height, width, reference_size)
+    return tuple(max(min_sigma, float(sigma) * scale) for sigma in sigmas)
+
+
+def _window_mean_at_indices(sequence: torch.Tensor, indices: torch.Tensor, window: int) -> torch.Tensor:
+    """Mean frame around one temporal index per batch item."""
+    window = max(1, int(window))
+    left = window // 2
+    right = window - left
+    frame_count = sequence.shape[2]
+    frames = []
+    for sample_idx in range(sequence.shape[0]):
+        center = int(indices[sample_idx].item())
+        start = max(0, center - left)
+        end = min(frame_count, center + right)
+        frames.append(sequence[sample_idx : sample_idx + 1, :, start:end].mean(dim=2))
+    return torch.cat(frames, dim=0)
+
+
+def _soft_threshold_tensor(x: torch.Tensor, tau: torch.Tensor | float) -> torch.Tensor:
+    return torch.sign(x) * (x.abs() - tau).clamp_min(0)
+
+
+def _svd_shrink_tensor(matrix: torch.Tensor, tau: torch.Tensor | float) -> torch.Tensor:
+    left_vectors, singular_values, right_vectors_t = torch.linalg.svd(matrix, full_matrices=False)
+    shrunk = (singular_values - tau).clamp_min(0)
+    return (left_vectors * shrunk.view(1, -1)) @ right_vectors_t
+
+
+@torch.no_grad()
+def rpca_sparse_component(
+    video: torch.Tensor,
+    lam: float | None = None,
+    max_iter: int = 20,
+    tol: float = 1.0e-5,
+) -> torch.Tensor:
+    """Signed RPCA sparse component for (B, 1, T, H, W) angiography clips.
+
+    Negative sparse values usually correspond to transient dark contrast inside
+    vessels; the low-rank component absorbs mostly stationary anatomy.
+    """
+    assert video.dim() == 5 and video.shape[1] == 1, "expected (B, 1, T, H, W)"
+    if max_iter <= 0 or video.shape[2] < 2:
+        return torch.zeros_like(video)
+
+    original_dtype = video.dtype
+    batch_size, _, frame_count, height, width = video.shape
+    sparse_frames = []
+    for sample_idx in range(batch_size):
+        matrix = video[sample_idx, 0].reshape(frame_count, height * width).float()
+        lambda_sparse = float(lam) if lam is not None else 1.0 / math.sqrt(max(frame_count, height * width))
+
+        spectral_norm = torch.linalg.svdvals(matrix).amax().clamp_min(1.0e-6)
+        mu = 1.25 / spectral_norm
+        mu_max = mu * 1.0e7
+        rho = 1.5
+
+        low_rank = torch.zeros_like(matrix)
+        sparse = torch.zeros_like(matrix)
+        dual = torch.zeros_like(matrix)
+        norm_matrix = torch.linalg.norm(matrix, ord="fro").clamp_min(1.0e-6)
+
+        for _ in range(max_iter):
+            low_rank = _svd_shrink_tensor(matrix - sparse + dual / mu, 1.0 / mu)
+            sparse = _soft_threshold_tensor(matrix - low_rank + dual / mu, lambda_sparse / mu)
+            residual = matrix - low_rank - sparse
+            dual = dual + mu * residual
+            mu = torch.minimum(mu * rho, mu_max)
+            err = torch.linalg.norm(residual, ord="fro") / norm_matrix
+            if float(err) < tol:
+                break
+
+        sparse_frames.append(sparse.reshape(1, 1, frame_count, height, width).to(original_dtype))
+    return torch.cat(sparse_frames, dim=0)
+
+
+@torch.no_grad()
+def bolus_peak_frame(
+    video: torch.Tensor,
+    roi: torch.Tensor | None = None,
+    baseline_frames: int = 2,
+    peak_window: int = 3,
+    top_fraction: float = 0.02,
+    highpass_sigma: float = 4.0,
+    min_frame: int | None = None,
+    rpca_sparse: torch.Tensor | None = None,
+    use_rpca: bool = False,
+    rpca_lam: float | None = None,
+    rpca_max_iter: int = 20,
+    rpca_tol: float = 1.0e-5,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select the frame/window with strongest localized dark bolus signal."""
+    assert video.dim() == 5 and video.shape[1] == 1, "expected (B, 1, T, H, W)"
+    batch_size, _, frame_count, height, width = video.shape
+    baseline_count = min(max(1, int(baseline_frames)), frame_count)
+    baseline = video[:, :, :baseline_count].mean(dim=2)
+    dark_signal = (baseline.unsqueeze(2) - video).clamp_min(0)
+
+    if rpca_sparse is None and use_rpca:
+        rpca_sparse = rpca_sparse_component(video, lam=rpca_lam, max_iter=rpca_max_iter, tol=rpca_tol)
+    if rpca_sparse is not None:
+        dark_signal = torch.maximum(dark_signal, (-rpca_sparse).clamp_min(0))
+
+    flat_dark = dark_signal.reshape(batch_size * frame_count, 1, height, width)
+    local_dark = (flat_dark - _gaussian_blur(flat_dark, sigma=max(0.3, highpass_sigma))).clamp_min(0)
+    local_dark = local_dark.reshape(batch_size, 1, frame_count, height, width)
+
+    if roi is None:
+        score_roi = torch.ones(batch_size, 1, height, width, device=video.device, dtype=video.dtype)
+    else:
+        score_roi = roi.to(device=video.device, dtype=video.dtype)
+
+    top_fraction = min(1.0, max(1.0e-5, float(top_fraction)))
+    blocked_frames = baseline_count if min_frame is None else max(0, int(min_frame))
+    blocked_frames = min(blocked_frames, max(0, frame_count - 1))
+
+    peak_indices = []
+    for sample_idx in range(batch_size):
+        mask_flat = (score_roi[sample_idx, 0] > 0.5).reshape(-1)
+        if not bool(mask_flat.any()):
+            mask_flat = torch.ones(height * width, device=video.device, dtype=torch.bool)
+        values = local_dark[sample_idx, 0].reshape(frame_count, height * width)[:, mask_flat]
+        top_count = max(1, min(values.shape[1], int(round(values.shape[1] * top_fraction))))
+        frame_scores = values.topk(top_count, dim=1).values.mean(dim=1)
+
+        if frame_count >= 3:
+            kernel = torch.tensor([0.25, 0.5, 0.25], device=video.device, dtype=frame_scores.dtype).view(1, 1, 3)
+            padded = F.pad(frame_scores.view(1, 1, -1), (1, 1), mode="replicate")
+            frame_scores = F.conv1d(padded, kernel).view(-1)
+        if blocked_frames > 0:
+            frame_scores[:blocked_frames] = torch.finfo(frame_scores.dtype).min
+        peak_indices.append(frame_scores.argmax())
+
+    peak_idx = torch.stack(peak_indices).long()
+    peak = _window_mean_at_indices(video, peak_idx, peak_window)
+    return peak, peak_idx
+
+
 @torch.no_grad()
 def frangi_vesselness(
     image: torch.Tensor,
@@ -204,6 +359,16 @@ def vessel_pseudo_gt(
     threshold: float = 0.18,
     positive_quantile: float = 0.78,
     edge_margin_px: int = 7,
+    scale_reference_size: float = 192.0,
+    frangi_sigmas: tuple[float, ...] | None = None,
+    highpass_sigma: float = 4.0,
+    fusion_blur_sigma: float = 0.7,
+    peak_window: int = 3,
+    peak_top_fraction: float = 0.02,
+    use_rpca: bool = False,
+    rpca_lam: float | None = None,
+    rpca_max_iter: int = 20,
+    rpca_tol: float = 1.0e-5,
 ) -> dict[str, torch.Tensor]:
     """Combined pseudo ground-truth from Frangi + event density, restricted to ROI.
 
@@ -219,17 +384,43 @@ def vessel_pseudo_gt(
             amp:        (B, 1, H, W) peak amplitude, normalized per-sample
     """
     b = video.shape[0]
-    peak = video[:, :, -3:].mean(dim=2)              # (B, 1, H, W) late-bolus frame
+    _, _, _, height, width = video.shape
+    scale = _scale_for_resolution(height, width, scale_reference_size)
+    scaled_edge_margin = _scaled_px(edge_margin_px, height, width, scale_reference_size)
+    scaled_highpass_sigma = max(0.3, highpass_sigma * scale)
+    scaled_fusion_blur_sigma = max(0.3, fusion_blur_sigma * scale)
+    vessel_sigmas = _scaled_sigmas(
+        frangi_sigmas or (0.8, 1.2, 1.8, 2.4),
+        height,
+        width,
+        scale_reference_size,
+    )
+
     baseline = video[:, :, :2].mean(dim=2)           # (B, 1, H, W) pre-contrast
     mean_img = video.mean(dim=2)
     temporal_std = video.std(dim=2)
 
-    target_roi = _erode_mask(roi, edge_margin_px)
+    target_roi = _erode_mask(roi, scaled_edge_margin)
+
+    sparse = None
+    if use_rpca:
+        sparse = rpca_sparse_component(video, lam=rpca_lam, max_iter=rpca_max_iter, tol=rpca_tol)
+    peak, peak_idx = bolus_peak_frame(
+        video,
+        roi=target_roi,
+        peak_window=peak_window,
+        top_fraction=peak_top_fraction,
+        highpass_sigma=scaled_highpass_sigma,
+        rpca_sparse=sparse,
+    )
 
     # Differential signal: vessels darken when contrast arrives.
     dark_signal = (baseline - peak).clamp(min=0.0)   # > 0 where pixel got darker
+    if sparse is not None:
+        sparse_peak = _window_mean_at_indices((-sparse).clamp_min(0), peak_idx, peak_window)
+        dark_signal = torch.maximum(dark_signal, sparse_peak)
     # Suppress broad anatomy-wide darkening and keep local line-like changes.
-    dark_local = (dark_signal - _gaussian_blur(dark_signal, sigma=4.0)).clamp(min=0.0)
+    dark_local = (dark_signal - _gaussian_blur(dark_signal, sigma=scaled_highpass_sigma)).clamp(min=0.0)
 
     # Inflow event density (where contrast arrived).
     inflow = events[:, 0].amax(dim=1, keepdim=True)  # first-inflow support
@@ -239,7 +430,7 @@ def vessel_pseudo_gt(
     # not just a large region that changed intensity.
     fr = frangi_vesselness(
         dark_local,
-        sigmas=(0.8, 1.2, 1.8, 2.4),
+        sigmas=vessel_sigmas,
         dark_on_bright=False,
     )
     static_edges = _spatial_gradient_mag(mean_img)
@@ -263,7 +454,7 @@ def vessel_pseudo_gt(
     # also locally tubular and dynamically supported.
     dynamic_support = (0.50 * inflow_n + 0.30 * event_n + 0.20 * dark_n).clamp(0, 1)
     combined = fr_n * dynamic_support * (0.35 + 0.65 * dynamic_gate) * target_roi
-    combined = _gaussian_blur(combined, sigma=0.7) * target_roi
+    combined = _gaussian_blur(combined, sigma=scaled_fusion_blur_sigma) * target_roi
     combined = _norm_in_roi(combined)
 
     q_thr = _masked_quantile(combined, target_roi, positive_quantile, fallback=threshold)
@@ -285,4 +476,6 @@ def vessel_pseudo_gt(
         "bat": bat,
         "amp": amp,
         "target_roi": target_roi,
+        "peak_frame": peak,
+        "peak_idx": peak_idx,
     }

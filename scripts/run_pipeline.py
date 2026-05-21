@@ -90,7 +90,7 @@ def train(cfg: dict, dataset: AngioSequenceDataset, ckpt_path: Path,
             video = batch["video"].to(device)
             opt.zero_grad()
             out = model(video)
-            targets = build_targets(video, out["events"])
+            targets = build_targets(video, out["events"], pseudo_gt_cfg=cfg.get("pseudo_gt"))
             loss, parts = loss_fn(out, video, targets=targets)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -114,15 +114,17 @@ def train(cfg: dict, dataset: AngioSequenceDataset, ckpt_path: Path,
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
 def visualize_sample(model: AngioFluxSSL, batch: dict, out_path: Path,
-                     device: torch.device, title: str = "") -> dict:
+                     device: torch.device, title: str = "",
+                     pseudo_gt_cfg: dict | None = None) -> dict:
     model.eval()
     video = batch["video"].to(device)
     out = model(video)
-    targets = build_targets(video, out["events"])
+    targets = build_targets(video, out["events"], pseudo_gt_cfg=pseudo_gt_cfg)
 
     vid = _to_np(video[0, 0])
     events = _to_np(out["events"][0])
-    peak = vid[-3:].mean(0)
+    peak = _to_np(targets["peak_frame"][0, 0])
+    peak_idx = int(targets["peak_idx"][0].item())
 
     roi = _to_np(targets["roi"][0, 0])
     target_roi = _to_np(targets.get("target_roi", targets["roi"])[0, 0])
@@ -154,7 +156,7 @@ def visualize_sample(model: AngioFluxSSL, batch: dict, out_path: Path,
 
     fig, axes = plt.subplots(3, 4, figsize=(16, 12))
     panels = [
-        (peak, "peak frame", "gray"),
+        (peak, f"peak frame idx={peak_idx}", "gray"),
         (roi, "ROI mask (collimator removed)", "gray"),
         (_norm01(inflow), "inflow events Σ", "Reds"),
         (_norm01(washout), "washout events Σ", "Blues"),
@@ -188,6 +190,7 @@ def visualize_sample(model: AngioFluxSSL, batch: dict, out_path: Path,
         "iou_vs_pseudo": iou_in_roi(mask_pred, pseudo_hard, target_roi),
         "roi_coverage": float(roi.mean()),
         "target_roi_coverage": float(target_roi.mean()),
+        "peak_idx": peak_idx,
         "path": batch["path"][0],
     }
 
@@ -252,7 +255,14 @@ def main() -> None:
                  f"ft={meta['frame_time_ms']:.1f}ms  |  "
                  f"px={meta['pixel_spacing_mm']:.3f}mm")
         viz_path = out_dir / "viz" / f"{i:02d}_{study_name}.png"
-        m = visualize_sample(model, batch, viz_path, device, title=title)
+        m = visualize_sample(
+            model,
+            batch,
+            viz_path,
+            device,
+            title=title,
+            pseudo_gt_cfg=cfg.get("pseudo_gt"),
+        )
         metrics.append(m)
         print(f"[viz] {i:02d} {study_name}  IoU={m['iou_vs_pseudo']:.3f}  "
               f"ROI={m['roi_coverage']:.2f}  recon_MAE={m['recon_mae_roi']:.4f}")

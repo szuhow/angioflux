@@ -11,7 +11,7 @@ from angio_flux.encoding import HemodynamicEventEncoder
 from angio_flux.losses.multitask import soft_skeleton
 from angio_flux.losses.ssl import build_targets
 from angio_flux.modules.vqfr import VQFRHead
-from angio_flux.preprocess import frangi_vesselness
+from angio_flux.preprocess import bolus_peak_frame, frangi_vesselness, rpca_sparse_component
 
 
 def _run_pipeline_module():
@@ -82,6 +82,37 @@ def test_frangi_responds_on_centerline_for_dark_and_bright_tubes():
 
     assert dark_response[0, 0, 32, 32].item() > 0.5 * dark_response.max().item()
     assert bright_response[0, 0, 32, 32].item() > 0.5 * bright_response.max().item()
+
+
+def test_bolus_peak_frame_uses_mid_sequence_darkening_not_tail():
+    video = torch.ones(1, 1, 8, 48, 48) * 0.8
+    roi = torch.ones(1, 1, 48, 48)
+    video[:, :, 2, 22:25, 10:38] = 0.45
+    video[:, :, 3, 22:25, 10:38] = 0.10
+    video[:, :, 4, 22:25, 10:38] = 0.35
+
+    peak, peak_idx = bolus_peak_frame(
+        video,
+        roi=roi,
+        peak_window=1,
+        top_fraction=0.02,
+        highpass_sigma=1.0,
+    )
+
+    assert peak_idx.item() == 3
+    assert peak[0, 0, 23, 20].item() == pytest.approx(0.10)
+
+
+def test_rpca_sparse_component_highlights_transient_dark_structure():
+    background = torch.linspace(0.35, 0.85, 16).view(1, 1, 1, 1, 16).expand(1, 1, 5, 16, 16).clone()
+    video = background.clone()
+    video[:, :, 2, 7:10, 4:12] -= 0.35
+
+    sparse = rpca_sparse_component(video, max_iter=8, tol=1.0e-4)
+
+    vessel_signal = (-sparse[0, 0, 2, 7:10, 4:12]).clamp_min(0).mean()
+    background_signal = sparse[0, 0, :, :3, :3].abs().mean()
+    assert vessel_signal > background_signal
 
 
 def test_real_pseudo_gt_does_not_include_roi_frame():

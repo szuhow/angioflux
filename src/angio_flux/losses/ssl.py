@@ -75,10 +75,39 @@ class DenseRegressionHead(nn.Module):
 
 
 @torch.no_grad()
-def build_targets(video: torch.Tensor, events: torch.Tensor) -> dict[str, torch.Tensor]:
+def build_targets(
+    video: torch.Tensor,
+    events: torch.Tensor,
+    pseudo_gt_cfg: dict | None = None,
+) -> dict[str, torch.Tensor]:
     """Compute ROI mask + pseudo-GT for mask, BAT, amplitude."""
-    roi = temporal_std_roi(video)
-    pgt = vessel_pseudo_gt(video, events, roi=roi)
+    pseudo_gt_cfg = pseudo_gt_cfg or {}
+    roi = temporal_std_roi(
+        video,
+        mean_quantile=pseudo_gt_cfg.get("roi_mean_quantile", 0.55),
+        shrink_frac=pseudo_gt_cfg.get("roi_shrink_frac", 0.10),
+    )
+    frangi_sigmas = pseudo_gt_cfg.get("frangi_sigmas")
+    if frangi_sigmas is not None:
+        frangi_sigmas = tuple(float(sigma) for sigma in frangi_sigmas)
+    pgt = vessel_pseudo_gt(
+        video,
+        events,
+        roi=roi,
+        threshold=pseudo_gt_cfg.get("threshold", 0.18),
+        positive_quantile=pseudo_gt_cfg.get("positive_quantile", 0.78),
+        edge_margin_px=pseudo_gt_cfg.get("edge_margin_px", 7),
+        scale_reference_size=pseudo_gt_cfg.get("scale_reference_size", 192.0),
+        frangi_sigmas=frangi_sigmas,
+        highpass_sigma=pseudo_gt_cfg.get("highpass_sigma", 4.0),
+        fusion_blur_sigma=pseudo_gt_cfg.get("fusion_blur_sigma", 0.7),
+        peak_window=pseudo_gt_cfg.get("peak_window", 3),
+        peak_top_fraction=pseudo_gt_cfg.get("peak_top_fraction", 0.02),
+        use_rpca=pseudo_gt_cfg.get("use_rpca", False),
+        rpca_lam=pseudo_gt_cfg.get("rpca_lam"),
+        rpca_max_iter=pseudo_gt_cfg.get("rpca_max_iter", 20),
+        rpca_tol=pseudo_gt_cfg.get("rpca_tol", 1.0e-5),
+    )
     pgt["roi"] = roi
     return pgt
 
@@ -114,7 +143,9 @@ class SSLPretrainLoss(nn.Module):
             targets = build_targets(video, out["events"])
         roi = targets["roi"]
 
-        target_frame = video[:, :, -3:].mean(dim=2)  # (B, 1, H, W)
+        target_frame = targets.get("peak_frame")
+        if target_frame is None:
+            target_frame = video[:, :, -3:].mean(dim=2)  # (B, 1, H, W)
         l_recon = _masked_l1(out["recon"], target_frame, roi)
 
         # BCE on the full image so the model is forced to predict 0 outside

@@ -1,5 +1,7 @@
 outputs/
 checkpoints/
+__pycache__/
+*.py[cod]
 .pytest_cache/
 .DS_Store
 doc.md
