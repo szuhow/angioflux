@@ -1,0 +1,51 @@
+# Vessel-JEPA pretraining: latent self-prediction + flow ordering.
+# No labels required. RPCA-dark is used as a weak flow prior.
+
+seed: 1337
+
+data:
+  root: "/Users/rafalszulinski/Desktop/developing/IVES/coronary/angio-frame-selector/data"
+  target_size: [256, 256]
+  max_frames: 64
+  min_frames: 16
+
+use_rpca_prior: true
+
+rpca:
+  lam: null
+  max_iter: 20
+  tol: 1.0e-5
+
+jepa:
+  patch_size: 16
+  tubelet_t: 8
+  embed_dim: 384       # must be divisible by 6 for SinusoidalPosEmbed3D
+  encoder_depth: 12
+  encoder_heads: 6
+  predictor_dim: 192   # narrow predictor (compression bottleneck)
+  predictor_depth: 6
+  predictor_heads: 6
+  ema_momentum_start: 0.99
+  ema_momentum_end: 1.0
+  num_target_blocks: 8
+  target_block: [2, 2, 2]   # (dt, dh, dw)
+  context_fraction: 0.4
+  flow_target_bias: 0.75
+  
+
+loss:
+  lambda_jepa: 1.0
+  lambda_vicreg_var: 4.0    # 1.0 -> 4.0: silniej karaj kolapsję
+  lambda_vicreg_cov: 0.25   # 0.04 -> 0.25: silniej dekoreluj kanały
+  lambda_bat_rank: 1.0      # 0.5 -> 1.0: BAT margin jest łatwy, zwiększ wagę
+  vicreg_var_target: 1.0
+  bat_margin: 0.15    
+
+train:
+  epochs: 20
+  lr: 1.0e-4
+  weight_decay: 0.05
+  device: "cpu"
+  batch_size: 1
+  num_workers: 0
+  ckpt_dir: "checkpoints/jepa"

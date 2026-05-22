@@ -5,3 +5,4 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 doc.md
+output_png/

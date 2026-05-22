@@ -54,6 +54,11 @@ class SpikingUNetPP(nn.Module):
         _, _, h2, w2 = x.shape
         return x.reshape(b, c, t, h2, w2)
 
+    @staticmethod
+    def _fuse_time(voxel: torch.Tensor) -> torch.Tensor:
+        """Max over time then mean of event channels — keeps bolus transients."""
+        return voxel.amax(dim=2)
+
     def forward(self, voxel: torch.Tensor) -> dict[str, torch.Tensor]:
         """
         Args:
@@ -65,7 +70,8 @@ class SpikingUNetPP(nn.Module):
             spike_rates: list of (B, C, H, W) per encoder level (for spike-rate loss)
             gates:       list of (g_struct, g_hemo) per level (for diagnostics)
         """
-        e1 = self.enc1(voxel)
+        fused = self._fuse_time(voxel).unsqueeze(2)
+        e1 = self.enc1(fused)
         g1s, g1h = self.plsr1(e1["mem"], e1["isi"])
         skip1 = self.skip1(e1["mem"], e1["spike_rate"], e1["isi"]) * g1s
 

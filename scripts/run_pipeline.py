@@ -27,6 +27,7 @@ from torch.utils.data import DataLoader
 from angio_flux.data import AngioSequenceDataset, collate_pad
 from angio_flux.losses.ssl import SSLPretrainLoss, build_targets
 from angio_flux.preprocess import rpca_sparse_component
+from angio_flux.segmentation import flow_vessel_segment
 from angio_flux.training.pretrain import AngioFluxSSL
 
 
@@ -154,6 +155,60 @@ def train(cfg: dict, dataset: AngioSequenceDataset, ckpt_path: Path,
 # --------------------------------------------------------------------------- #
 # inference + visualization                                                   #
 # --------------------------------------------------------------------------- #
+@torch.no_grad()
+def _visualize_flow_only(
+    batch: dict,
+    out_path: Path,
+    device: torch.device,
+    title: str = "",
+    cfg: dict | None = None,
+) -> dict:
+    cfg = cfg or {}
+    video = batch["video"].to(device)
+    out = flow_vessel_segment(
+        video,
+        pseudo_gt_cfg=cfg.get("pseudo_gt", {}),
+        use_rpca=cfg.get("pseudo_gt", {}).get("use_rpca", True),
+        fuse_weights=tuple(cfg.get("fuse_weights", (0.40, 0.30, 0.20, 0.10))),
+    )
+    targets = out["pseudo_gt"]
+    mask_pred = _to_np(out["soft_mask"][0, 0])
+    pseudo_hard = _to_np(targets["hard_mask"][0, 0])
+    target_roi = _to_np(targets["target_roi"][0, 0])
+    peak = _to_np(targets["peak_frame"][0, 0])
+    best_iou, best_thr = best_iou_in_roi(mask_pred, pseudo_hard, target_roi)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(2, 3, figsize=(12, 8))
+    panels = [
+        (peak, "peak frame", "gray"),
+        (target_roi, "target ROI", "gray"),
+        (_norm01(mask_pred) * target_roi, "flow segment soft", "magma"),
+        (pseudo_hard, "pseudo-GT hard", "gray"),
+        (out["hard_mask"][0, 0].cpu().numpy(), "flow segment hard", "gray"),
+        (_norm01(_to_np(out["event_saliency"][0, 0])), "event saliency", "viridis"),
+    ]
+    for ax, (img, label, cmap) in zip(axes.flat, panels):
+        if label == "curve":
+            continue
+        ax.imshow(img, cmap=cmap, vmin=0, vmax=1 if cmap == "gray" else None)
+        ax.set_title(label)
+        ax.axis("off")
+    fig.suptitle(title or batch["path"][0], fontsize=10)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+
+    return {
+        "iou_vs_pseudo": iou_in_roi(mask_pred, pseudo_hard, target_roi),
+        "best_iou_vs_pseudo": best_iou,
+        "best_iou_threshold": best_thr,
+        "roi_coverage": float(target_roi.mean()),
+        "path": batch["path"][0],
+        "mode": "flow_only",
+    }
+
+
 @torch.no_grad()
 def visualize_sample(model: AngioFluxSSL, batch: dict, out_path: Path,
                      device: torch.device, title: str = "",
@@ -321,6 +376,11 @@ def main() -> None:
     p.add_argument("--no-train", action="store_true")
     p.add_argument("--ckpt", type=str, default=None)
     p.add_argument("--seed", type=int, default=1337)
+    p.add_argument(
+        "--flow-only",
+        action="store_true",
+        help="skip SSL training; segment with physics-based flow_vessel_segment",
+    )
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -346,14 +406,17 @@ def main() -> None:
 
     ckpt_path = out_dir / "model.pt" if args.ckpt is None else Path(args.ckpt)
 
-    if args.no_train:
+    if args.flow_only:
+        model = None
+        print("[mode] flow-only segmentation (RPCA + HEE + pseudo-GT fusion)")
+    elif args.no_train:
         if not ckpt_path.exists():
             raise SystemExit(f"--no-train but no checkpoint at {ckpt_path}")
         model = AngioFluxSSL(cfg).to(device)
         state = torch.load(ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(state["model"])
         print(f"[train] loaded {ckpt_path}")
-    else:
+    elif not args.no_train:
         epochs = args.epochs if args.epochs is not None else cfg["train"]["epochs"]
         model = train(cfg, dataset, ckpt_path, epochs=epochs, device=device)
 
@@ -368,17 +431,31 @@ def main() -> None:
                  f"ft={meta['frame_time_ms']:.1f}ms  |  "
                  f"px={meta['pixel_spacing_mm']:.3f}mm")
         viz_path = out_dir / "viz" / f"{i:02d}_{study_name}.png"
-        m = visualize_sample(
-            model,
-            batch,
-            viz_path,
-            device,
-            title=title,
-            pseudo_gt_cfg=cfg.get("pseudo_gt"),
-        )
+        if args.flow_only:
+            m = _visualize_flow_only(
+                batch,
+                viz_path,
+                device,
+                title=title,
+                cfg=cfg,
+            )
+        else:
+            m = visualize_sample(
+                model,
+                batch,
+                viz_path,
+                device,
+                title=title,
+                pseudo_gt_cfg=cfg.get("pseudo_gt"),
+            )
         metrics.append(m)
-        print(f"[viz] {i:02d} {study_name}  IoU={m['iou_vs_pseudo']:.3f}  "
-              f"ROI={m['roi_coverage']:.2f}  recon_MAE={m['recon_mae_roi']:.4f}")
+        line = (
+            f"[viz] {i:02d} {study_name}  IoU={m['iou_vs_pseudo']:.3f}  "
+            f"ROI={m['roi_coverage']:.2f}"
+        )
+        if "recon_mae_roi" in m:
+            line += f"  recon_MAE={m['recon_mae_roi']:.4f}"
+        print(line)
 
     with open(out_dir / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
@@ -387,7 +464,9 @@ def main() -> None:
         print(f"\n[summary] over {len(metrics)} samples:")
         print(f"  mean IoU vs pseudo-GT : {np.mean([m['iou_vs_pseudo'] for m in metrics]):.3f}")
         print(f"  mean ROI coverage     : {np.mean([m['roi_coverage'] for m in metrics]):.3f}")
-        print(f"  mean recon MAE (ROI)  : {np.mean([m['recon_mae_roi'] for m in metrics]):.4f}")
+        if any("recon_mae_roi" in m for m in metrics):
+            recon_vals = [m["recon_mae_roi"] for m in metrics if "recon_mae_roi" in m]
+            print(f"  mean recon MAE (ROI)  : {np.mean(recon_vals):.4f}")
     print(f"[done] visualizations → {out_dir/'viz'}  metrics → {out_dir/'metrics.json'}")
 
 

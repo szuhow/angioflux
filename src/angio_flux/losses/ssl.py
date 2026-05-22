@@ -173,7 +173,8 @@ class SSLPretrainLoss(nn.Module):
         l_mask_bce = _masked_bce_with_logits(
             out["mask_logits"], mask_target, mask_loss_weight, pos_weight=self.pos_weight
         )
-        l_mask_dice = _masked_soft_dice(out["mask"], mask_target, target_roi)
+        mask_for_dice = out.get("mask_raw", out["mask"])
+        l_mask_dice = _masked_soft_dice(mask_for_dice, mask_target, target_roi)
         l_mask = 0.5 * l_mask_bce + 0.5 * l_mask_dice
 
         l_flow_prior = torch.zeros((), device=video.device, dtype=video.dtype)
