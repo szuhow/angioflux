@@ -78,15 +78,17 @@ def flow_aware_target_indices(
         idx: (num_targets,) long
     """
     rng = rng or random.Random()
+    device = presence.device
     n = presence.numel()
-    p = presence.clone().clamp(min=0)
+    p = presence.reshape(-1).float().clone().clamp(min=0)
     if p.sum() < 1e-8:
-        weights = torch.ones(n) / n
+        weights = torch.ones(n, device=device) / n
     else:
         p = p / (p.sum() + 1e-8)
-        uniform = torch.ones(n) / n
+        uniform = torch.ones(n, device=device) / n
         weights = bias_strength * p + (1.0 - bias_strength) * uniform
     weights = weights / weights.sum()
-    # Sample without replacement
-    idx = torch.multinomial(weights, num_samples=min(num_targets, n), replacement=False)
+    idx = torch.multinomial(
+        weights, num_samples=min(num_targets, n), replacement=False
+    )
     return idx

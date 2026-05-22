@@ -45,7 +45,7 @@ train:
   epochs: 20
   lr: 1.0e-4
   weight_decay: 0.05
-  device: "cpu"
+  device: "cuda"
   batch_size: 1
   num_workers: 0
   ckpt_dir: "checkpoints/jepa"

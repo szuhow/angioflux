@@ -10,7 +10,7 @@ from angio_flux.jepa import (
     build_grid_positions,
 )
 from angio_flux.jepa.masking import batched_masks, sample_context_target_masks
-from angio_flux.jepa.sampling import rpca_inflow_times
+from angio_flux.jepa.sampling import flow_aware_target_indices, rpca_inflow_times
 from angio_flux.jepa.tubelet import TubeletPatchifier
 from angio_flux.losses.jepa import VesselJEPALoss, bat_rank_loss, vicreg_terms
 
@@ -138,6 +138,35 @@ def test_smoke_jepa_forward_backward():
     # Predictor must also receive gradient.
     pred_grads = [p.grad for p in model.predictor.parameters() if p.grad is not None]
     assert len(pred_grads) > 0
+
+
+def test_flow_aware_target_indices_respects_input_device():
+    presence = torch.tensor([0.1, 0.9, 0.2, 0.8], device="cpu")
+    inflow = torch.tensor([0, 1, 2, 3], device="cpu")
+    idx = flow_aware_target_indices(presence, inflow, num_targets=2)
+    assert idx.device == presence.device
+
+    if torch.cuda.is_available():
+        presence_cuda = presence.cuda()
+        inflow_cuda = inflow.cuda()
+        idx_cuda = flow_aware_target_indices(presence_cuda, inflow_cuda, num_targets=2)
+        assert idx_cuda.device.type == "cuda"
+
+
+def test_batched_masks_flow_bias_on_cuda():
+    if not torch.cuda.is_available():
+        import pytest
+        pytest.skip("CUDA not available")
+    grid = (2, 2, 2)
+    presence = torch.rand(1, 8, device="cuda")
+    inflow = torch.randint(0, 4, (1, 8), device="cuda")
+    ctx_idx, tgt_idx = batched_masks(
+        1, grid, num_targets=2, flow_bias=0.8, presence=presence, inflow_time=inflow, seed=0
+    )
+    ctx_idx = ctx_idx.cuda()
+    tgt_idx = tgt_idx.cuda()
+    assert ctx_idx.device.type == "cuda"
+    assert tgt_idx.device.type == "cuda"
 
 
 def test_ema_update_moves_target_toward_student():
