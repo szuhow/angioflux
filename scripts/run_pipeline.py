@@ -26,6 +26,7 @@ from torch.utils.data import DataLoader
 
 from angio_flux.data import AngioSequenceDataset, collate_pad
 from angio_flux.losses.ssl import SSLPretrainLoss, build_targets
+from angio_flux.preprocess import rpca_sparse_component
 from angio_flux.training.pretrain import AngioFluxSSL
 
 
@@ -50,6 +51,26 @@ def iou_in_roi(mask_pred: np.ndarray, pseudo_hard: np.ndarray, roi: np.ndarray) 
     return float(inter / max(1, union))
 
 
+def iou_at_threshold(
+    mask_pred: np.ndarray,
+    pseudo_hard: np.ndarray,
+    roi: np.ndarray,
+    threshold: float,
+) -> float:
+    pred = mask_pred > threshold
+    gt = pseudo_hard > 0.5
+    roi_m = roi > 0.5
+    inter = (pred & gt & roi_m).sum()
+    union = ((pred | gt) & roi_m).sum()
+    return float(inter / max(1, union))
+
+
+def best_iou_in_roi(mask_pred: np.ndarray, pseudo_hard: np.ndarray, roi: np.ndarray) -> tuple[float, float]:
+    candidates = np.linspace(0.10, 0.70, 13)
+    scores = [(iou_at_threshold(mask_pred, pseudo_hard, roi, float(thr)), float(thr)) for thr in candidates]
+    return max(scores, key=lambda item: item[0])
+
+
 # --------------------------------------------------------------------------- #
 # training                                                                    #
 # --------------------------------------------------------------------------- #
@@ -70,8 +91,11 @@ def train(cfg: dict, dataset: AngioSequenceDataset, ckpt_path: Path,
         lambda_amp=cfg["ssl"].get("lambda_amp", 0.5),
         lambda_consist=cfg["ssl"]["lambda_consist"],
         lambda_spike=cfg["ssl"]["lambda_spike"],
+        lambda_flow_prior=cfg["ssl"].get("lambda_flow_prior", 0.0),
         spike_target_rate=cfg["loss"]["spike_target_rate"],
         pos_weight=cfg["ssl"].get("pos_weight", 5.0),
+        mask_bg_weight=cfg["ssl"].get("mask_bg_weight", 1.0),
+        regression_bg_weight=cfg["ssl"].get("regression_bg_weight", 0.15),
     )
     opt = torch.optim.AdamW(
         model.parameters(),
@@ -89,8 +113,26 @@ def train(cfg: dict, dataset: AngioSequenceDataset, ckpt_path: Path,
         for step, batch in enumerate(loader, start=1):
             video = batch["video"].to(device)
             opt.zero_grad()
-            out = model(video)
-            targets = build_targets(video, out["events"], pseudo_gt_cfg=cfg.get("pseudo_gt"))
+            pseudo_cfg = cfg.get("pseudo_gt", {})
+            use_shared_rpca = bool(
+                pseudo_cfg.get("use_rpca", False)
+                or cfg.get("hee", {}).get("event_input") == "rpca"
+            )
+            rpca_sparse = None
+            if use_shared_rpca:
+                rpca_sparse = rpca_sparse_component(
+                    video,
+                    lam=pseudo_cfg.get("rpca_lam"),
+                    max_iter=pseudo_cfg.get("rpca_max_iter", 20),
+                    tol=pseudo_cfg.get("rpca_tol", 1.0e-5),
+                )
+            out = model(video, rpca_sparse=rpca_sparse)
+            targets = build_targets(
+                video,
+                out["events"],
+                pseudo_gt_cfg=cfg.get("pseudo_gt"),
+                rpca_sparse=rpca_sparse,
+            )
             loss, parts = loss_fn(out, video, targets=targets)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -118,8 +160,26 @@ def visualize_sample(model: AngioFluxSSL, batch: dict, out_path: Path,
                      pseudo_gt_cfg: dict | None = None) -> dict:
     model.eval()
     video = batch["video"].to(device)
-    out = model(video)
-    targets = build_targets(video, out["events"], pseudo_gt_cfg=pseudo_gt_cfg)
+    pseudo_gt_cfg = pseudo_gt_cfg or {}
+    use_shared_rpca = bool(
+        pseudo_gt_cfg.get("use_rpca", False)
+        or getattr(model, "cfg", {}).get("hee", {}).get("event_input") == "rpca"
+    )
+    rpca_sparse = None
+    if use_shared_rpca:
+        rpca_sparse = rpca_sparse_component(
+            video,
+            lam=pseudo_gt_cfg.get("rpca_lam"),
+            max_iter=pseudo_gt_cfg.get("rpca_max_iter", 20),
+            tol=pseudo_gt_cfg.get("rpca_tol", 1.0e-5),
+        )
+    out = model(video, rpca_sparse=rpca_sparse)
+    targets = build_targets(
+        video,
+        out["events"],
+        pseudo_gt_cfg=pseudo_gt_cfg,
+        rpca_sparse=rpca_sparse,
+    )
 
     vid = _to_np(video[0, 0])
     events = _to_np(out["events"][0])
@@ -130,14 +190,28 @@ def visualize_sample(model: AngioFluxSSL, batch: dict, out_path: Path,
     target_roi = _to_np(targets.get("target_roi", targets["roi"])[0, 0])
     pseudo_soft = _to_np(targets["soft_mask"][0, 0])
     pseudo_hard = _to_np(targets["hard_mask"][0, 0])
+    mask_target = _to_np(targets.get("mask_target", targets["soft_mask"])[0, 0])
+    regression_mask = _to_np(targets.get("regression_mask", targets["hard_mask"])[0, 0])
+    rpca_dark_peak = _to_np(targets.get("rpca_dark_peak", targets["soft_mask"] * 0)[0, 0])
+    dark_local = _to_np(targets.get("dark_local", targets["soft_mask"])[0, 0])
+    dynamic_support = _to_np(targets.get("dynamic_support", targets["soft_mask"])[0, 0])
+    contrast_support = _to_np(targets.get("contrast_support", targets["soft_mask"])[0, 0])
+    peak_scores = _to_np(targets.get("peak_scores", torch.zeros(1, vid.shape[0], device=video.device))[0])
     bat_gt = _to_np(targets["bat"][0, 0])
     amp_gt = _to_np(targets["amp"][0, 0])
 
-    mask_pred_raw = _to_np(out["mask"][0, 0])
-    mask_pred = mask_pred_raw * target_roi
+    mask_pred_raw = _to_np(out.get("mask_raw", out["mask"])[0, 0])
+    mask_pred_gated = _to_np(out["mask"][0, 0])
+    contrast_gate = _to_np(out.get("contrast_gate", torch.ones_like(out["mask"]))[0, 0])
+    model_flow_gate = _to_np(
+        out.get("flow_gate", out.get("contrast_gate", torch.ones_like(out["mask"])))[0, 0]
+    )
+    mask_pred = mask_pred_gated * target_roi
+    mask_pred_flow = mask_pred
     bat_pred = _to_np(out["bat"][0, 0]) * target_roi
     amp_pred = _to_np(out["amp"][0, 0]) * target_roi
     recon = _to_np(out["recon"][0, 0])
+    best_iou, best_thr = best_iou_in_roi(mask_pred, pseudo_hard, target_roi)
 
     inflow = events[0].sum(0)
     washout = events[1].sum(0)
@@ -145,7 +219,7 @@ def visualize_sample(model: AngioFluxSSL, batch: dict, out_path: Path,
     # Vessels overlay: peak frame in grayscale + thresholded mask in red.
     overlay = np.stack([peak, peak, peak], axis=-1)
     overlay = _norm01(overlay)
-    m_thr = (mask_pred > 0.5).astype(np.float32)
+    m_thr = (mask_pred_flow > 0.2).astype(np.float32)
     overlay[..., 0] = np.clip(overlay[..., 0] + 0.7 * m_thr, 0, 1)
     overlay[..., 1] = overlay[..., 1] * (1 - 0.4 * m_thr)
     overlay[..., 2] = overlay[..., 2] * (1 - 0.4 * m_thr)
@@ -154,27 +228,50 @@ def visualize_sample(model: AngioFluxSSL, batch: dict, out_path: Path,
     bat_overlay = plt.cm.turbo(bat_pred)[..., :3]
     bat_overlay = bat_overlay * (mask_pred > 0.3)[..., None] + (1 - (mask_pred > 0.3)[..., None]) * 0.1
 
-    fig, axes = plt.subplots(3, 4, figsize=(16, 12))
+    fig, axes = plt.subplots(6, 4, figsize=(16, 21))
     panels = [
         (peak, f"peak frame idx={peak_idx}", "gray"),
         (roi, "ROI mask (collimator removed)", "gray"),
+        (target_roi, "target ROI (eroded)", "gray"),
+        ("curve", "peak score curve", None),
+        (_norm01(rpca_dark_peak), "RPCA dark at peak", "magma"),
+        (contrast_gate * target_roi, "contrast gate", "magma"),
+        (dark_local, "local dark signal", "magma"),
+        (contrast_support, "contrast support", "magma"),
+        (model_flow_gate * target_roi, "model contrast-flow gate", "viridis"),
+        (dynamic_support, "dynamic support", "viridis"),
         (_norm01(inflow), "inflow events Σ", "Reds"),
         (_norm01(washout), "washout events Σ", "Blues"),
         (pseudo_soft, "pseudo-GT mask (soft)", "viridis"),
         (pseudo_hard, "pseudo-GT mask (hard)", "viridis"),
-        (mask_pred, "predicted mask", "viridis"),
-        (overlay, "vessel overlay (pred)", None),
+        (mask_target, "mask target", "viridis"),
+        (regression_mask, "BAT/amp support", "viridis"),
+        (mask_pred_raw * target_roi, "predicted mask raw", "viridis"),
+        (mask_pred, "predicted mask gated", "viridis"),
+        (mask_pred_flow, "predicted mask flow-gated", "viridis"),
+        (overlay, "vessel overlay (flow-gated)", None),
         (bat_gt, "BAT pseudo-GT", "turbo"),
         (bat_pred, "BAT predicted", "turbo"),
         (amp_gt, "amplitude pseudo-GT", "magma"),
         (amp_pred, "amplitude predicted", "magma"),
     ]
     for ax, (img, name, cmap) in zip(axes.flat, panels):
-        if cmap is None:
+        if isinstance(img, str) and img == "curve":
+            finite = np.isfinite(peak_scores) & (peak_scores > -1.0e20)
+            y = peak_scores.copy()
+            if finite.any():
+                floor = float(y[finite].min())
+                y[~finite] = floor
+            ax.plot(np.arange(len(y)), y, color="black", linewidth=1.5)
+            ax.axvline(peak_idx, color="red", linewidth=1.0)
+            ax.set_xlim(0, max(1, len(y) - 1))
+        elif cmap is None:
             ax.imshow(img)
         else:
             ax.imshow(img, cmap=cmap, vmin=0, vmax=1)
         ax.set_title(name, fontsize=10)
+        ax.axis("off")
+    for ax in axes.flat[len(panels):]:
         ax.axis("off")
     fig.suptitle(title, fontsize=11)
     fig.tight_layout()
@@ -185,12 +282,28 @@ def visualize_sample(model: AngioFluxSSL, batch: dict, out_path: Path,
     return {
         "recon_mae_roi": float(np.mean(np.abs(recon - peak) * roi) / max(1e-6, roi.mean())),
         "pred_mean_in_roi": float((mask_pred * target_roi).sum() / max(1.0, target_roi.sum())),
-        "pred_mean_outside_roi": float((mask_pred_raw * (1.0 - target_roi)).sum() / max(1.0, (1.0 - target_roi).sum())),
+        "pred_flow_mean_in_roi": float((mask_pred_flow * target_roi).sum() / max(1.0, target_roi.sum())),
+        "pred_raw_mean_in_roi": float((mask_pred_raw * target_roi).sum() / max(1.0, target_roi.sum())),
+        "pred_mean_outside_roi": float(
+            (mask_pred_gated * (1.0 - target_roi)).sum() / max(1.0, (1.0 - target_roi).sum())
+        ),
+        "pred_raw_mean_outside_roi": float(
+            (mask_pred_raw * (1.0 - target_roi)).sum() / max(1.0, (1.0 - target_roi).sum())
+        ),
         "pseudo_mean_in_roi": float((pseudo_hard * target_roi).sum() / max(1.0, target_roi.sum())),
+        "mask_target_mean_in_roi": float((mask_target * target_roi).sum() / max(1.0, target_roi.sum())),
+        "regression_support_mean_in_roi": float(
+            (regression_mask * target_roi).sum() / max(1.0, target_roi.sum())
+        ),
         "iou_vs_pseudo": iou_in_roi(mask_pred, pseudo_hard, target_roi),
+        "iou_flow_vs_pseudo": iou_at_threshold(mask_pred_flow, pseudo_hard, target_roi, 0.2),
+        "iou_thr_0_3": iou_at_threshold(mask_pred, pseudo_hard, target_roi, 0.3),
+        "best_iou_vs_pseudo": best_iou,
+        "best_iou_threshold": best_thr,
         "roi_coverage": float(roi.mean()),
         "target_roi_coverage": float(target_roi.mean()),
         "peak_idx": peak_idx,
+        "peak_scores": [float(v) for v in peak_scores],
         "path": batch["path"][0],
     }
 

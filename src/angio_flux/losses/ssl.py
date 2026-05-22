@@ -23,6 +23,10 @@ def _masked_l1(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> 
     return diff.sum() / denom
 
 
+def _masked_zero_l1(pred: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    return (pred.abs() * mask).sum() / mask.sum().clamp_min(1.0)
+
+
 def _masked_bce_with_logits(
     logits: torch.Tensor,
     target: torch.Tensor,
@@ -79,6 +83,7 @@ def build_targets(
     video: torch.Tensor,
     events: torch.Tensor,
     pseudo_gt_cfg: dict | None = None,
+    rpca_sparse: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute ROI mask + pseudo-GT for mask, BAT, amplitude."""
     pseudo_gt_cfg = pseudo_gt_cfg or {}
@@ -99,11 +104,13 @@ def build_targets(
         edge_margin_px=pseudo_gt_cfg.get("edge_margin_px", 7),
         scale_reference_size=pseudo_gt_cfg.get("scale_reference_size", 192.0),
         frangi_sigmas=frangi_sigmas,
+        baseline_quantile=pseudo_gt_cfg.get("baseline_quantile", 0.85),
         highpass_sigma=pseudo_gt_cfg.get("highpass_sigma", 4.0),
         fusion_blur_sigma=pseudo_gt_cfg.get("fusion_blur_sigma", 0.7),
         peak_window=pseudo_gt_cfg.get("peak_window", 3),
         peak_top_fraction=pseudo_gt_cfg.get("peak_top_fraction", 0.02),
         use_rpca=pseudo_gt_cfg.get("use_rpca", False),
+        rpca_sparse=rpca_sparse,
         rpca_lam=pseudo_gt_cfg.get("rpca_lam"),
         rpca_max_iter=pseudo_gt_cfg.get("rpca_max_iter", 20),
         rpca_tol=pseudo_gt_cfg.get("rpca_tol", 1.0e-5),
@@ -123,8 +130,11 @@ class SSLPretrainLoss(nn.Module):
         lambda_amp: float = 0.5,
         lambda_consist: float = 0.1,
         lambda_spike: float = 1.0e-3,
+        lambda_flow_prior: float = 0.0,
         spike_target_rate: float = 0.05,
         pos_weight: float = 5.0,
+        mask_bg_weight: float = 1.0,
+        regression_bg_weight: float = 0.15,
     ) -> None:
         super().__init__()
         self.lambda_recon = lambda_recon
@@ -133,8 +143,11 @@ class SSLPretrainLoss(nn.Module):
         self.lambda_amp = lambda_amp
         self.lambda_consist = lambda_consist
         self.lambda_spike = lambda_spike
+        self.lambda_flow_prior = lambda_flow_prior
         self.spike_target_rate = spike_target_rate
         self.pos_weight = pos_weight
+        self.mask_bg_weight = mask_bg_weight
+        self.regression_bg_weight = regression_bg_weight
 
     def forward(
         self, out: dict, video: torch.Tensor, targets: dict | None = None
@@ -152,17 +165,37 @@ class SSLPretrainLoss(nn.Module):
         # the ROI as well. Inside ROI uses pos_weight to balance vessel/bg;
         # outside ROI target is 0 → pulls predictions to background.
         full = torch.ones_like(roi)
-        mask_target = torch.maximum(targets["soft_mask"], targets["hard_mask"])
+        target_roi = targets.get("target_roi", roi)
+        mask_loss_weight = target_roi + self.mask_bg_weight * (full - target_roi)
+        mask_target = targets.get("mask_target")
+        if mask_target is None:
+            mask_target = torch.maximum(targets["soft_mask"], targets["hard_mask"])
         l_mask_bce = _masked_bce_with_logits(
-            out["mask_logits"], mask_target, full, pos_weight=self.pos_weight
+            out["mask_logits"], mask_target, mask_loss_weight, pos_weight=self.pos_weight
         )
-        l_mask_dice = _masked_soft_dice(out["mask"], mask_target, full)
+        l_mask_dice = _masked_soft_dice(out["mask"], mask_target, target_roi)
         l_mask = 0.5 * l_mask_bce + 0.5 * l_mask_dice
 
-        # Regression targets are 0 outside ROI; supervise the whole image so
-        # background gets pulled to 0 instead of free-floating.
-        l_bat = _masked_l1(out["bat"], targets["bat"], full)
-        l_amp = _masked_l1(out["amp"], targets["amp"], full)
+        l_flow_prior = torch.zeros((), device=video.device, dtype=video.dtype)
+        flow_gate = out.get("flow_gate")
+        if flow_gate is not None:
+            raw_mask = out.get("mask_raw", out["mask"])
+            non_flow = (1.0 - flow_gate).clamp(0, 1) * target_roi
+            l_flow_prior = _masked_zero_l1(raw_mask, non_flow)
+
+        # BAT/amplitude are meaningful only where the pseudo vessel support is
+        # non-zero. Supervising them over the whole background makes all-zero
+        # maps an easy local optimum.
+        regression_mask = targets.get("regression_mask")
+        if regression_mask is None:
+            regression_mask = torch.maximum(targets["soft_mask"], targets["hard_mask"])
+        bat_target = targets["bat_time"] if "bat_time" in targets else targets["bat"]
+        amp_target = targets["amp_full"] if "amp_full" in targets else targets["amp"]
+        l_bat_fg = _masked_l1(out["bat"], bat_target, regression_mask)
+        l_amp_fg = _masked_l1(out["amp"], amp_target, regression_mask)
+        regression_bg = (full - regression_mask).clamp(0, 1)
+        l_bat = l_bat_fg + self.regression_bg_weight * _masked_zero_l1(out["bat"], regression_bg)
+        l_amp = l_amp_fg + self.regression_bg_weight * _masked_zero_l1(out["amp"], regression_bg)
 
         ev = out["events"]
         l_consist = (ev[:, 0] * ev[:, 1]).mean()
@@ -177,10 +210,12 @@ class SSLPretrainLoss(nn.Module):
             + self.lambda_amp * l_amp
             + self.lambda_consist * l_consist
             + self.lambda_spike * l_spike
+            + self.lambda_flow_prior * l_flow_prior
         )
         return total, {
             "recon": l_recon.detach(),
             "mask": l_mask.detach(),
+            "flow_prior": l_flow_prior.detach(),
             "bat": l_bat.detach(),
             "amp": l_amp.detach(),
             "consist": l_consist.detach(),

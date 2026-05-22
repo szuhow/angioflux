@@ -162,3 +162,124 @@ def events_to_voxel(events: torch.Tensor, num_bins: int) -> torch.Tensor:
         bins.append(events[:, :, t0:t1].sum(dim=2))  # (B,4,H,W)
     voxel = torch.cat(bins, dim=1)  # (B, 4*num_bins, H, W)
     return voxel
+
+
+def contrast_channel_count(cfg: dict) -> int:
+    """Number of continuous RPCA contrast channels appended to S-UNet input."""
+    hee_cfg = cfg.get("hee", {})
+    if hee_cfg.get("event_input", "raw") != "rpca":
+        return 0
+    return len(hee_cfg.get("contrast_channels", []))
+
+
+def append_contrast_channels(
+    events: torch.Tensor,
+    rpca_dark: torch.Tensor | None,
+    channels: list[str] | tuple[str, ...] | None,
+) -> torch.Tensor:
+    """Append continuous contrast-state channels aligned to event timesteps.
+
+    HEE events say that a threshold crossing happened. These channels preserve
+    whether that crossing occurred inside RPCA-highlighted contrast, which is
+    what separates vessel bolus motion from moving anatomy edges.
+    """
+    channels = list(channels or [])
+    if rpca_dark is None or not channels:
+        return events
+    if rpca_dark.dim() != 5 or rpca_dark.shape[1] != 1:
+        raise ValueError(f"expected rpca_dark (B,1,T,H,W), got {tuple(rpca_dark.shape)}")
+
+    event_steps = events.shape[2]
+    presence = rpca_dark[:, :, 1:]
+    delta = rpca_dark[:, :, 1:] - rpca_dark[:, :, :-1]
+    candidates = {
+        "presence": presence,
+        "inflow": delta.clamp_min(0),
+        "washout": (-delta).clamp_min(0),
+    }
+
+    extra = []
+    for name in channels:
+        if name not in candidates:
+            raise ValueError(f"unknown contrast channel {name!r}")
+        channel = candidates[name]
+        if channel.shape[2] > event_steps:
+            channel = channel[:, :, :event_steps]
+        elif channel.shape[2] < event_steps:
+            pad = channel[:, :, -1:].expand(-1, -1, event_steps - channel.shape[2], -1, -1)
+            channel = torch.cat([channel, pad], dim=2)
+        extra.append(channel.to(device=events.device, dtype=events.dtype))
+    return torch.cat([events, *extra], dim=1)
+
+
+def contrast_prior_map(
+    rpca_dark: torch.Tensor | None,
+    gamma: float = 1.0,
+) -> torch.Tensor | None:
+    """Dense vessel-contrast prior from RPCA dark signal.
+
+    This is not a vessel mask by itself; it gates learned predictions away from
+    anatomy that may move but never carries contrast.
+    """
+    if rpca_dark is None:
+        return None
+    if rpca_dark.dim() != 5 or rpca_dark.shape[1] != 1:
+        raise ValueError(f"expected rpca_dark (B,1,T,H,W), got {tuple(rpca_dark.shape)}")
+    prior = rpca_dark[:, :, 1:].amax(dim=2).clamp(0, 1)
+    gamma = max(0.25, float(gamma))
+    if gamma != 1.0:
+        prior = prior.pow(gamma)
+    return prior
+
+
+def _normalize_batched_map(x: torch.Tensor) -> torch.Tensor:
+    """Normalize each sample's spatial map to [0, 1] without cross-sample leakage."""
+    scale = x.flatten(1).amax(dim=1).view(-1, 1, 1, 1).clamp_min(1.0e-6)
+    return (x / scale).clamp(0, 1)
+
+
+def contrast_flow_prior_map(
+    rpca_dark: torch.Tensor | None,
+    events: torch.Tensor | None = None,
+    gamma: float = 1.0,
+    min_flow_weight: float = 0.10,
+) -> torch.Tensor | None:
+    """Temporal contrast-injection prior for vessel-carrying pixels.
+
+    ``contrast_prior_map`` marks any pixel that was RPCA-dark at least once.
+    This stricter prior additionally requires transient inflow/range behavior,
+    so static anatomy or persistent motion artifacts do not dominate the mask.
+    """
+    if rpca_dark is None:
+        return None
+    if rpca_dark.dim() != 5 or rpca_dark.shape[1] != 1:
+        raise ValueError(f"expected rpca_dark (B,1,T,H,W), got {tuple(rpca_dark.shape)}")
+    if rpca_dark.shape[2] < 2:
+        return contrast_prior_map(rpca_dark, gamma=gamma)
+
+    presence = rpca_dark[:, :, 1:].amax(dim=2).clamp(0, 1)
+    delta = rpca_dark[:, :, 1:] - rpca_dark[:, :, :-1]
+    inflow = _normalize_batched_map(delta.clamp_min(0).sum(dim=2))
+    washout = _normalize_batched_map((-delta).clamp_min(0).sum(dim=2))
+    temporal_range = _normalize_batched_map(
+        (rpca_dark[:, :, 1:].amax(dim=2) - rpca_dark[:, :, 1:].amin(dim=2)).clamp_min(0)
+    )
+
+    flow_state = (0.55 * inflow + 0.30 * temporal_range + 0.15 * washout).clamp(0, 1)
+    if events is not None:
+        if events.dim() != 5 or events.shape[1] < 2:
+            raise ValueError(f"expected events (B,C,T,H,W) with C>=2, got {tuple(events.shape)}")
+        hemo = events[:, :2].sum(dim=(1, 2), keepdim=False).unsqueeze(1)
+        if events.shape[1] > 2:
+            motion = events[:, 2:].sum(dim=(1, 2), keepdim=False).unsqueeze(1)
+        else:
+            motion = torch.zeros_like(hemo)
+        hemo_ratio = (hemo / (hemo + motion + 1.0)).clamp(0, 1)
+        flow_state = flow_state * (0.35 + 0.65 * hemo_ratio)
+
+    min_flow_weight = min(0.95, max(0.0, float(min_flow_weight)))
+    prior = presence * (min_flow_weight + (1.0 - min_flow_weight) * flow_state)
+    gamma = max(0.25, float(gamma))
+    if gamma != 1.0:
+        prior = prior.pow(gamma)
+    return prior.clamp(0, 1)

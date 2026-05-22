@@ -3,8 +3,8 @@
 seed: 1337
 
 data:
-  height: 128
-  width: 128
+  height: 256
+  width: 256
   num_frames: 32
   batch_size: 2
 
